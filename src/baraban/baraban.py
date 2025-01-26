@@ -154,8 +154,14 @@ class ABTestConfig(BaseConfig):
     @field_validator("groups")
     @classmethod
     def validate_groups(cls, v: Optional[List[str]], info) -> Optional[List[str]]:
-        if v is not None and len(v) != 2:
-            raise ValueError("The length of groups must be 2")
+        if v is not None:
+            if len(v) != 2:
+                raise ValueError("The length of groups must be 2")
+            if "experiment_data" in info.data and "group_column" in info.data:
+                unique_groups = info.data["experiment_data"][info.data["group_column"]].unique()
+                missing_groups = [g for g in v if g not in unique_groups]
+                if missing_groups:
+                    raise ValueError(f"Groups {missing_groups} not found in experiment_data")
         return v
 
 class ABTestStrategy(ABC):
@@ -553,8 +559,8 @@ class ABTestCalculator(ABTestStrategy):
             "Control Mean": control_mean,
             "Test Mean": test_mean,
             "Diff (%)": diff_percent,
-            "Control Installs": len(control),
-            "Test Installs": len(test),
+            "Control Installs": int(len(control)),
+            "Test Installs": int(len(test)),
             "Lower Bound": lower_bound,
             "Upper Bound": upper_bound,
             "Verdict": "Significant" if p_value < self.config.alpha else "Non-Significant"
