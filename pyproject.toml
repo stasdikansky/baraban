@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "baraban"
+version = "0.1.0"
+description = "Библиотека для проведения A/B тестов и расчета размера выборки."
+readme = "README.md"
+authors = [{name="Stas Dikansky"}]
+license = {file="LICENSE"}
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "scipy>=1.7.0",
+    "statsmodels>=0.13.0",
+    "pydantic>=2.0.0",
+    "tqdm>=4.65.0",
+    "otvertka>=0.1.7",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/stasdikansky/baraban"
+"Bug Tracker" = "https://github.com/stasdikansky/baraban/issues" 
