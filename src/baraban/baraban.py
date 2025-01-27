@@ -9,7 +9,6 @@ import scipy.stats as ss
 from otvertka import handle_outliers
 from pydantic import BaseModel, Field, field_validator
 from statsmodels.stats.power import tt_ind_solve_power
-from tqdm import tqdm
 
 
 class OutlierHandlingMethod(str, Enum):
@@ -636,9 +635,11 @@ class ABTestCalculator(ABTestStrategy):
                 metric: executor.submit(self._run_bootstrap, df, metric, is_stratified)
                 for metric in self.config.metrics
             }
+            
+            print("Processing metrics...")
             results = {
                 metric: future.result()
-                for metric, future in tqdm(futures.items(), desc="Processing metrics")
+                for metric, future in futures.items()
             }
 
         df_result = pd.concat([results[metric] for metric in self.config.metrics])

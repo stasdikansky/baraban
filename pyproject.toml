@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "baraban"
-version = "0.1.3"
+version = "0.1.4"
 description = "Библиотека для проведения A/B тестов и расчета размера выборки."
 readme = "README.md"
 authors = [{name="Stas Dikansky"}]
