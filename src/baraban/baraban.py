@@ -113,6 +113,10 @@ class SampleSizeConfig(BaseConfig):
         "two-sided",
         description="Type of test for continuous metrics: 'two-sided', 'larger', or 'smaller'"
     )
+    are_correction: bool = Field(
+        False,
+        description="Whether to apply Asymptotic Relative Efficiency correction for non-normal distributions"
+    )
 
     @field_validator("effect_sizes")
     @classmethod
@@ -325,7 +329,7 @@ class SampleSizeCalculator(ABTestStrategy):
         For binary metrics, uses Evan Miller's method.
         For continuous metrics:
         - If normal: uses power analysis with Cohen's d
-        - If non-normal: uses power analysis with Cohen's d and ARE correction for Mann-Whitney U test
+        - If non-normal and are_correction=True: uses power analysis with Cohen's d and ARE correction for Mann-Whitney U test
 
         Parameters
         ----------
@@ -342,6 +346,7 @@ class SampleSizeCalculator(ABTestStrategy):
             DataFrame with required sample sizes for each effect size
         """
         data = []
+        
         if self._is_binary_metric(df, metric):
             curr_conversion = df[metric].sum() / df[metric].count()
             
@@ -381,10 +386,10 @@ class SampleSizeCalculator(ABTestStrategy):
                 # For "smaller" alternative, make effect_size negative
                 if self.config.continuous_alternative == "smaller":
                     effect_size = -effect_size
-
+                
                 absolute_change = metric_mean * effect_size
                 cohen_d = absolute_change / std_dev
-
+                
                 # Always use positive effect_size for sample size calculation
                 sample_size = float(tt_ind_solve_power(
                     effect_size=cohen_d,
@@ -393,8 +398,8 @@ class SampleSizeCalculator(ABTestStrategy):
                     alternative=self.config.continuous_alternative,
                 ))
 
-                # Apply ARE correction for non-normal distributions
-                if not is_normal:
+                # Apply ARE correction only if enabled and distribution is non-normal
+                if self.config.are_correction and not is_normal:
                     sample_size = sample_size / 0.955  # ARE correction (1/0.955 ≈ 1.047)
 
                 row.append(int(np.ceil(sample_size)) // 100 * 100)
@@ -803,6 +808,7 @@ class ABTestBuilder:
         alpha: float = 0.05,
         power: float = 0.8,
         continuous_alternative: str = "two-sided",
+        are_correction: bool = False,
         historical_data: Optional[pd.DataFrame] = None,
         strata: Optional[List[str]] = None,
         outliers_handling_method: Optional[str] = None,
@@ -825,6 +831,8 @@ class ABTestBuilder:
             Statistical power (1 - Type II error rate), by default 0.8
         continuous_alternative : str, optional
             Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
+        are_correction : bool, optional
+            Whether to apply Asymptotic Relative Efficiency correction for non-normal distributions, by default False
         historical_data : pd.DataFrame, optional
             DataFrame with historical data for stratification
         strata : List[str], optional
@@ -848,6 +856,7 @@ class ABTestBuilder:
             alpha=alpha,
             power=power,
             continuous_alternative=continuous_alternative,
+            are_correction=are_correction,
             historical_data=historical_data,
             strata=strata,
             outliers=OutlierConfig(
@@ -941,6 +950,7 @@ class ABTester:
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
         continuous_alternative: str = "two-sided",
+        are_correction: bool = False,
     ) -> pd.DataFrame:
         """Calculate required sample size for A/B test.
         
@@ -968,6 +978,8 @@ class ABTester:
             Type of outliers to handle ('upper', 'lower', or 'two-sided')
         continuous_alternative : str, optional
             Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
+        are_correction : bool, optional
+            Whether to apply Asymptotic Relative Efficiency correction for non-normal distributions, by default False
         
         Returns
         -------
@@ -986,6 +998,7 @@ class ABTester:
             outliers_threshold_quantile=outliers_threshold_quantile,
             outliers_type=outliers_type,
             continuous_alternative=continuous_alternative,
+            are_correction=are_correction,
         )
         calculator = SampleSizeCalculator(config)
         return calculator.execute()
