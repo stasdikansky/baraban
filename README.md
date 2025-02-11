@@ -28,7 +28,8 @@ sample_size = tester.calculate_sample_size(
     power=0.8,
     outliers_handling_method='replace_threshold',
     outliers_threshold_quantile=0.995,
-    outliers_type='upper'
+    outliers_type='upper',
+    continuous_alternative='larger',
 )
 
 # Проведение A/B теста
@@ -44,7 +45,7 @@ ab_test = tester.run_abtest(
     outliers_handling_method='replace_threshold',
     outliers_threshold_quantile=0.995,
     outliers_type='upper',
-    boot_iterations=10000
+    continuous_alternative='larger',
 )
 ```
 
@@ -56,8 +57,7 @@ ab_test = tester.run_abtest(
 - scipy 1.7+
 - statsmodels 0.13+
 - pydantic 2.0+
-- otvertka 0.1.7+
-- tqdm 4.65+
+- otvertka 0.1.10+
 
 ## Лицензия
 

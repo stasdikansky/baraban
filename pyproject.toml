@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "baraban"
-version = "0.1.4"
+version = "0.1.5"
 description = "Библиотека для проведения A/B тестов и расчета размера выборки."
 readme = "README.md"
 authors = [{name="Stas Dikansky"}]
@@ -16,8 +16,7 @@ dependencies = [
     "scipy>=1.7.0",
     "statsmodels>=0.13.0",
     "pydantic>=2.0.0",
-    "tqdm>=4.65.0",
-    "otvertka>=0.1.7",
+    "otvertka>=0.1.10",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

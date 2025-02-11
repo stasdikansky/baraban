@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
-from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -62,6 +61,10 @@ class BaseConfig(BaseModel):
         lt=1, 
         description="Statistical power (1 - Type II error rate)"
     )
+    continuous_alternative: str = Field(
+        "two-sided",
+        description="Type of test for continuous metrics: 'two-sided', 'larger', or 'smaller'"
+    )
     historical_data: Optional[pd.DataFrame] = None
     strata: Optional[List[str]] = Field(
         None,
@@ -72,6 +75,13 @@ class BaseConfig(BaseModel):
         None,
         description="Configuration for outlier handling"
     )
+
+    @field_validator("continuous_alternative")
+    @classmethod
+    def validate_alternative(cls, v: str) -> str:
+        if v not in ["two-sided", "larger", "smaller"]:
+            raise ValueError("continuous_alternative must be one of: 'two-sided', 'larger', 'smaller'")
+        return v
 
     @field_validator("strata")
     @classmethod
@@ -98,6 +108,10 @@ class SampleSizeConfig(BaseConfig):
         ...,
         description="DataFrame with pre-experiment data"
     )
+    continuous_alternative: str = Field(
+        "two-sided",
+        description="Type of test for continuous metrics: 'two-sided', 'larger', or 'smaller'"
+    )
 
     @field_validator("effect_sizes")
     @classmethod
@@ -115,6 +129,13 @@ class SampleSizeConfig(BaseConfig):
                 raise ValueError(f"Metrics {missing_metrics} not found in pre_experiment_data")
         return v
 
+    @field_validator("continuous_alternative")
+    @classmethod
+    def validate_alternative(cls, v: str) -> str:
+        if v not in ["two-sided", "larger", "smaller"]:
+            raise ValueError("continuous_alternative must be one of: 'two-sided', 'larger', 'smaller'")
+        return v
+
 class ABTestConfig(BaseConfig):
     """Configuration for A/B test execution"""
     experiment_data: pd.DataFrame = Field(
@@ -130,11 +151,6 @@ class ABTestConfig(BaseConfig):
         min_items=2,
         max_items=2,
         description="List of group names [control, test]"
-    )
-    boot_iterations: int = Field(
-        10000,
-        gt=0,
-        description="Number of bootstrap iterations"
     )
 
     @field_validator("experiment_data")
@@ -274,13 +290,41 @@ class SampleSizeCalculator(ABTestStrategy):
         unique_values = df[metric].nunique()
         return unique_values == 2 and set(df[metric].unique()).issubset({0, 1})
 
+    def _check_normality(self, data: np.ndarray) -> bool:
+        """Check if data follows normal distribution.
+
+        Uses Shapiro-Wilk test for small samples (n <= 5000) and
+        D'Agostino-Pearson test for large samples (n > 5000).
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Array of values to test for normality
+
+        Returns
+        -------
+        bool
+            True if data is normally distributed (p-value > 0.05),
+            False otherwise
+        """
+        if len(data) > 5000:
+            # Use D'Agostino-Pearson test for large samples
+            _, p_value = ss.normaltest(data)
+        else:
+            # Use Shapiro-Wilk test for small samples
+            _, p_value = ss.shapiro(data)
+        
+        return p_value > 0.05
+
     def _calc_sample_size_for_metric(
         self, df: pd.DataFrame, metric: str, is_stratified: bool = False
     ) -> pd.DataFrame:
         """Calculate required sample size for a single metric.
 
         For binary metrics, uses Evan Miller's method.
-        For continuous metrics, uses power analysis with Cohen's d.
+        For continuous metrics:
+        - If normal: uses power analysis with Cohen's d
+        - If non-normal: uses power analysis with Cohen's d and ARE correction for Mann-Whitney U test
 
         Parameters
         ----------
@@ -297,7 +341,6 @@ class SampleSizeCalculator(ABTestStrategy):
             DataFrame with required sample sizes for each effect size
         """
         data = []
-        
         if self._is_binary_metric(df, metric):
             curr_conversion = df[metric].sum() / df[metric].count()
             
@@ -329,17 +372,31 @@ class SampleSizeCalculator(ABTestStrategy):
                     weights=self.weights
                 ))
 
+            # Check normality
+            is_normal = self._check_normality(df[metric].values)
+
             row = []
             for effect_size in self.config.effect_sizes:
+                # For "smaller" alternative, make effect_size negative
+                if self.config.continuous_alternative == "smaller":
+                    effect_size = -effect_size
+
                 absolute_change = metric_mean * effect_size
                 cohen_d = absolute_change / std_dev
-                sample_size = tt_ind_solve_power(
+
+                # Always use positive effect_size for sample size calculation
+                sample_size = float(tt_ind_solve_power(
                     effect_size=cohen_d,
                     alpha=self.config.alpha,
                     power=self.config.power,
-                    alternative="two-sided",
-                )
-                row.append(round(float(sample_size)) // 100 * 100)
+                    alternative=self.config.continuous_alternative,
+                ))
+
+                # Apply ARE correction for non-normal distributions
+                if not is_normal:
+                    sample_size = sample_size / 0.955  # ARE correction (1/0.955 ≈ 1.047)
+
+                row.append(int(np.ceil(sample_size)) // 100 * 100)
             data.append(row)
 
         columns = [f"{change * 100:.1f}%" for change in self.config.effect_sizes]
@@ -421,7 +478,7 @@ class SampleSizeCalculator(ABTestStrategy):
 class ABTestCalculator(ABTestStrategy):
     """Strategy for executing A/B test analysis.
 
-    This class implements A/B test analysis using bootstrap resampling,
+    This class implements A/B test analysis using classical statistical tests,
     with optional stratification and outlier handling.
 
     Attributes
@@ -434,6 +491,12 @@ class ABTestCalculator(ABTestStrategy):
     def __init__(self, config: ABTestConfig):
         self.config = config
         self.weights: Optional[dict] = None
+        # Mapping between our alternative names and scipy's
+        self._alternative_mapping = {
+            "larger": "less",  # Change direction since scipy test is x < y
+            "smaller": "greater",  # Change direction since scipy test is x > y
+            "two-sided": "two-sided"
+        }
 
     def _is_binary_metric(self, df: pd.DataFrame, metric: str) -> bool:
         """Check if metric contains only binary (0/1) values.
@@ -453,16 +516,123 @@ class ABTestCalculator(ABTestStrategy):
         unique_values = df[metric].nunique()
         return unique_values == 2 and set(df[metric].unique()).issubset({0, 1})
 
-    def _run_bootstrap(
+    def _check_normality(self, data: np.ndarray) -> bool:
+        """Check if data follows normal distribution.
+
+        Uses Shapiro-Wilk test for small samples (n <= 5000) and
+        D'Agostino-Pearson test for large samples (n > 5000).
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Array of values to test for normality
+
+        Returns
+        -------
+        bool
+            True if data is normally distributed (p-value > 0.05),
+            False otherwise
+        """
+        if len(data) > 5000:
+            # Use D'Agostino-Pearson test for large samples
+            _, p_value = ss.normaltest(data)
+        else:
+            # Use Shapiro-Wilk test for small samples
+            _, p_value = ss.shapiro(data)
+        
+        return p_value > 0.05
+
+    def _check_equal_variances(self, control: np.ndarray, test: np.ndarray) -> bool:
+        """Check if two samples have equal variances using Levene test.
+
+        Parameters
+        ----------
+        control : np.ndarray
+            Control group data
+        test : np.ndarray
+            Test group data
+
+        Returns
+        -------
+        bool
+            True if variances are equal (p-value > 0.05),
+            False otherwise
+        """
+        _, p_value = ss.levene(control, test)
+        return p_value > 0.05
+
+    def _calc_pvalue(
+        self,
+        control: np.ndarray,
+        test: np.ndarray,
+        is_binary: bool = False
+    ) -> float:
+        """Calculate p-value using appropriate statistical test.
+
+        For binary metrics:
+            - Uses Z-test for proportions
+        For continuous metrics:
+            - If data is normal and variances are equal: Student's t-test
+            - If data is normal but variances are unequal: Welch's t-test
+            - If data is not normal: Mann-Whitney U test
+
+        Parameters
+        ----------
+        control : np.ndarray
+            Control group data
+        test : np.ndarray
+            Test group data
+        is_binary : bool, optional
+            Whether the metric is binary, by default False
+
+        Returns
+        -------
+        float
+            P-value from the statistical test
+        """
+        if is_binary:
+            # Z-test for proportions
+            from statsmodels.stats.proportion import proportions_ztest
+            count = np.array([np.sum(test), np.sum(control)])
+            nobs = np.array([len(test), len(control)])
+            _, p_value = proportions_ztest(count=count, nobs=nobs)
+        else:
+            # Check normality for both groups
+            is_normal = (
+                self._check_normality(control) and 
+                self._check_normality(test)
+            )
+            
+            # Convert our alternative name to scipy's
+            # Note: scipy.stats tests compare x vs y as x < y for 'less' and x > y for 'greater'
+            # We want to compare test vs control, so we need to swap the direction
+            scipy_alternative = self._alternative_mapping[self.config.continuous_alternative]
+            
+            if is_normal:
+                # Check variance equality
+                equal_var = self._check_equal_variances(control, test)
+                # Use appropriate t-test
+                _, p_value = ss.ttest_ind(
+                    control, test,  # control = x, test = y
+                    equal_var=equal_var,
+                    alternative=scipy_alternative
+                )
+            else:
+                # Use Mann-Whitney U test
+                _, p_value = ss.mannwhitneyu(
+                    control, test,  # control = x, test = y
+                    alternative=scipy_alternative
+                )
+        
+        return float(p_value)
+
+    def _run_test(
         self, 
         df: pd.DataFrame, 
         metric: str, 
         is_stratified: bool = False
     ) -> pd.DataFrame:
-        """Run bootstrap analysis for a single metric.
-
-        Performs parallel bootstrap resampling to estimate the sampling distribution
-        of the difference between control and test groups.
+        """Run statistical test analysis for a single metric.
 
         Parameters
         ----------
@@ -481,7 +651,6 @@ class ABTestCalculator(ABTestStrategy):
                 - Control and test means
                 - Relative difference
                 - Sample sizes
-                - Confidence bounds
                 - Statistical significance verdict
 
         Raises
@@ -498,58 +667,26 @@ class ABTestCalculator(ABTestStrategy):
         if is_stratified:
             control = df.query(f"{self.config.group_column} == @control_group")[[metric, "strat"]]
             test = df.query(f"{self.config.group_column} == @test_group")[[metric, "strat"]]
+            control_values = control[metric].values
+            test_values = test[metric].values
         else:
-            control = df.query(f"{self.config.group_column} == @control_group")[metric].values
-            test = df.query(f"{self.config.group_column} == @test_group")[metric].values
-            
-        boot_len = max(len(control), len(test))
-        boot_data = np.zeros(self.config.boot_iterations)
-        control_means = np.zeros(self.config.boot_iterations)
-        test_means = np.zeros(self.config.boot_iterations)
+            control_values = df.query(f"{self.config.group_column} == @control_group")[metric].values
+            test_values = df.query(f"{self.config.group_column} == @test_group")[metric].values
 
-        # Parallel execution of bootstrap iterations
-        with ProcessPoolExecutor() as executor:
-            futures = []
-            for _ in range(self.config.boot_iterations):
-                future = executor.submit(
-                    run_bootstrap_iteration,
-                    control=control,
-                    test=test,
-                    boot_len=boot_len,
-                    is_stratified=is_stratified,
-                    strat="strat" if is_stratified else None,
-                    weights=self.weights if is_stratified else None,
-                    metric=metric if is_stratified else None,
-                )
-                futures.append(future)
-            
-            for i, future in enumerate(futures):
-                control_stat_value, test_stat_value, diff = future.result()
-                boot_data[i] = diff
-                control_means[i] = control_stat_value
-                test_means[i] = test_stat_value
+        is_binary = self._is_binary_metric(df, metric)
+        p_value = round(self._calc_pvalue(control_values, test_values, is_binary), 3)
 
-        p_value = round(
-            min(np.sum(boot_data >= 0), np.sum(boot_data <= 0))
-            * 2
-            / len(boot_data),
-            3
-        )
+        control_mean = round(np.mean(control_values), 3)
+        test_mean = round(np.mean(test_values), 3)
 
-        control_mean = round(np.mean(control[metric] if is_stratified else control), 3)
-        test_mean = round(np.mean(test[metric] if is_stratified else test), 3)
-
-        if self._is_binary_metric(df, metric):
-            control_conversion = round(control[metric].sum() / control[metric].count() * 100, 3) if is_stratified else round(np.sum(control) / len(control) * 100, 3)
-            test_conversion = round(test[metric].sum() / test[metric].count() * 100, 3) if is_stratified else round(np.sum(test) / len(test) * 100, 3)
+        if is_binary:
+            control_conversion = round(np.sum(control_values) / len(control_values) * 100, 3)
+            test_conversion = round(np.sum(test_values) / len(test_values) * 100, 3)
             diff_percent = round(test_conversion - control_conversion, 3)
         else:
             diff_percent = round((test_mean - control_mean) / control_mean * 100, 3) if control_mean != 0 else None
 
-        diff_percent = f"{diff_percent}%"
-
-        lower_bound = round(np.quantile(boot_data, self.config.alpha / 2), 3)
-        upper_bound = round(np.quantile(boot_data, 1 - self.config.alpha / 2), 3)
+        diff_percent = f"{diff_percent}%" if diff_percent is not None else "N/A"
 
         result = {
             "Control Name": control_group,
@@ -558,10 +695,8 @@ class ABTestCalculator(ABTestStrategy):
             "Control Mean": control_mean,
             "Test Mean": test_mean,
             "Diff (%)": diff_percent,
-            "Control Installs": int(len(control)),
-            "Test Installs": int(len(test)),
-            "Lower Bound": lower_bound,
-            "Upper Bound": upper_bound,
+            "Control Installs": int(len(control_values)),
+            "Test Installs": int(len(test_values)),
             "Verdict": "Significant" if p_value < self.config.alpha else "Non-Significant"
         }
 
@@ -576,7 +711,7 @@ class ABTestCalculator(ABTestStrategy):
         Process:
             1. Handle outliers if configured (skip for binary metrics)
             2. Apply stratification if historical data and strata are provided
-            3. Run parallel bootstrap analysis for each metric
+            3. Run statistical tests for each metric
             4. Combine and format results with styling
 
         Returns
@@ -629,18 +764,11 @@ class ABTestCalculator(ABTestStrategy):
                     df = self._handle_outliers(df, metric)
             is_stratified = False
 
-        # Parallel execution of bootstrap for different metrics
-        with ProcessPoolExecutor() as executor:
-            futures = {
-                metric: executor.submit(self._run_bootstrap, df, metric, is_stratified)
-                for metric in self.config.metrics
-            }
-            
-            print("Processing metrics...")
-            results = {
-                metric: future.result()
-                for metric, future in futures.items()
-            }
+        # Sequential execution for different metrics
+        results = {
+            metric: self._run_test(df, metric, is_stratified)
+            for metric in self.config.metrics
+        }
 
         df_result = pd.concat([results[metric] for metric in self.config.metrics])
         
@@ -656,8 +784,6 @@ class ABTestCalculator(ABTestStrategy):
             'Control Mean': '{:.3f}',
             'Test Mean': '{:.3f}',
             'Diff (%)': lambda x: f"{float(x.strip('%')):.2f}%",
-            'Lower Bound': '{:.3f}',
-            'Upper Bound': '{:.3f}',
             'Control Installs': '{:.0f}',
             'Test Installs': '{:.0f}'
         })
@@ -676,6 +802,7 @@ class ABTestBuilder:
         pre_experiment_data: pd.DataFrame,
         alpha: float = 0.05,
         power: float = 0.8,
+        continuous_alternative: str = "two-sided",
         historical_data: Optional[pd.DataFrame] = None,
         strata: Optional[List[str]] = None,
         outliers_handling_method: Optional[str] = None,
@@ -696,6 +823,8 @@ class ABTestBuilder:
             Significance level (Type I error rate), by default 0.05
         power : float, optional
             Statistical power (1 - Type II error rate), by default 0.8
+        continuous_alternative : str, optional
+            Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
         historical_data : pd.DataFrame, optional
             DataFrame with historical data for stratification
         strata : List[str], optional
@@ -718,6 +847,7 @@ class ABTestBuilder:
             pre_experiment_data=pre_experiment_data,
             alpha=alpha,
             power=power,
+            continuous_alternative=continuous_alternative,
             historical_data=historical_data,
             strata=strata,
             outliers=OutlierConfig(
@@ -735,12 +865,12 @@ class ABTestBuilder:
         groups: Optional[List[str]] = None,
         alpha: float = 0.05,
         power: float = 0.8,
+        continuous_alternative: str = "two-sided",
         historical_data: Optional[pd.DataFrame] = None,
         strata: Optional[List[str]] = None,
         outliers_handling_method: Optional[str] = None,
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
-        boot_iterations: int = 10000,
     ) -> ABTestConfig:
         """Create configuration for A/B test execution.
 
@@ -758,6 +888,8 @@ class ABTestBuilder:
             Significance level (Type I error rate), by default 0.05
         power : float, optional
             Statistical power (1 - Type II error rate), by default 0.8
+        continuous_alternative : str, optional
+            Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
         historical_data : pd.DataFrame, optional
             DataFrame with historical data for stratification
         strata : List[str], optional
@@ -768,8 +900,6 @@ class ABTestBuilder:
             Quantile threshold for outlier detection
         outliers_type : str, optional
             Type of outliers to handle ('upper', 'lower', or 'two-sided')
-        boot_iterations : int, optional
-            Number of bootstrap iterations, by default 10000
 
         Returns
         -------
@@ -783,6 +913,7 @@ class ABTestBuilder:
             groups=groups,
             alpha=alpha,
             power=power,
+            continuous_alternative=continuous_alternative,
             historical_data=historical_data,
             strata=strata,
             outliers=OutlierConfig(
@@ -790,7 +921,6 @@ class ABTestBuilder:
                 threshold_quantile=outliers_threshold_quantile,
                 type=outliers_type
             ),
-            boot_iterations=boot_iterations,
         )
 
 class ABTester:
@@ -810,6 +940,7 @@ class ABTester:
         outliers_handling_method: Optional[str] = None,
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
+        continuous_alternative: str = "two-sided",
     ) -> pd.DataFrame:
         """Calculate required sample size for A/B test.
         
@@ -835,6 +966,8 @@ class ABTester:
             Quantile threshold for outlier detection
         outliers_type : str, optional
             Type of outliers to handle ('upper', 'lower', or 'two-sided')
+        continuous_alternative : str, optional
+            Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
         
         Returns
         -------
@@ -852,6 +985,7 @@ class ABTester:
             outliers_handling_method=outliers_handling_method,
             outliers_threshold_quantile=outliers_threshold_quantile,
             outliers_type=outliers_type,
+            continuous_alternative=continuous_alternative,
         )
         calculator = SampleSizeCalculator(config)
         return calculator.execute()
@@ -869,7 +1003,7 @@ class ABTester:
         outliers_handling_method: Optional[str] = None,
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
-        boot_iterations: int = 10000,
+        continuous_alternative: str = "two-sided",
     ) -> pd.DataFrame:
         """Run A/B test analysis.
         
@@ -897,8 +1031,8 @@ class ABTester:
             Quantile threshold for outlier detection
         outliers_type : str, optional
             Type of outliers to handle ('upper', 'lower', or 'two-sided')
-        boot_iterations : int, optional
-            Number of bootstrap iterations, by default 10000
+        continuous_alternative : str, optional
+            Type of test for continuous metrics: 'two-sided' (default), 'larger', or 'smaller'
         
         Returns
         -------
@@ -917,7 +1051,7 @@ class ABTester:
             outliers_handling_method=outliers_handling_method,
             outliers_threshold_quantile=outliers_threshold_quantile,
             outliers_type=outliers_type,
-            boot_iterations=boot_iterations,
+            continuous_alternative=continuous_alternative,
         )
         calculator = ABTestCalculator(config)
         return calculator.execute()
@@ -1068,57 +1202,3 @@ def calc_stratified_variance(
     """
     strat_var = df.groupby(strat)[metric].var().fillna(0)
     return (strat_var * pd.Series(weights)).sum()
-
-def run_bootstrap_iteration(
-    control: np.ndarray | pd.DataFrame,
-    test: np.ndarray | pd.DataFrame,
-    boot_len: int,
-    is_stratified: bool,
-    strat: Optional[str] = None,
-    weights: Optional[dict] = None,
-    metric: Optional[str] = None,
-) -> Tuple[float, float, float]:
-    """Execute one iteration of bootstrap resampling.
-
-    Performs resampling with or without stratification and calculates statistics
-    for both control and test groups.
-
-    Parameters
-    ----------
-    control : np.ndarray | pd.DataFrame
-        Control group data (DataFrame for stratified, array for simple)
-    test : np.ndarray | pd.DataFrame
-        Test group data (DataFrame for stratified, array for simple)
-    boot_len : int
-        Length of bootstrap sample
-    is_stratified : bool
-        Whether to use stratified sampling
-    strat : str, optional
-        Name of stratification column (required if is_stratified=True)
-    weights : dict, optional
-        Stratum weights (required if is_stratified=True)
-    metric : str, optional
-        Name of metric column (required if is_stratified=True)
-
-    Returns
-    -------
-    Tuple[float, float, float]
-        Tuple containing:
-            - Control group statistic
-            - Test group statistic
-            - Difference (control - test)
-    """
-    if is_stratified:
-        control_sample = get_stratified_sample(df=control, strat=strat)
-        test_sample = get_stratified_sample(df=test, strat=strat)
-        control_stat_value = calc_stratified_mean(df=control_sample, strat=strat, metric=metric, weights=weights)
-        test_stat_value = calc_stratified_mean(df=test_sample, strat=strat, metric=metric, weights=weights)
-    else:
-        control_indices = np.random.randint(0, len(control), boot_len)
-        test_indices = np.random.randint(0, len(test), boot_len)
-        control_sample = control[control_indices]
-        test_sample = test[test_indices]
-        control_stat_value = np.mean(control_sample)
-        test_stat_value = np.mean(test_sample)
-    
-    return control_stat_value, test_stat_value, control_stat_value - test_stat_value
