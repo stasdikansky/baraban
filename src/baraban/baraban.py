@@ -8,6 +8,7 @@ import scipy.stats as ss
 from otvertka import handle_outliers
 from pydantic import BaseModel, Field, field_validator
 from statsmodels.stats.power import tt_ind_solve_power
+from statsmodels.stats.proportion import proportions_ztest
 
 
 class OutlierHandlingMethod(str, Enum):
@@ -592,7 +593,6 @@ class ABTestCalculator(ABTestStrategy):
         """
         if is_binary:
             # Z-test for proportions
-            from statsmodels.stats.proportion import proportions_ztest
             count = np.array([np.sum(test), np.sum(control)])
             nobs = np.array([len(test), len(control)])
             _, p_value = proportions_ztest(count=count, nobs=nobs)
