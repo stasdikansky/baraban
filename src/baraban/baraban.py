@@ -679,17 +679,17 @@ class ABTestCalculator(ABTestStrategy):
             test_values = df.query(f"{self.config.group_column} == @test_group")[metric].values
 
         is_binary = self._is_binary_metric(df, metric)
-        p_value = round(self._calc_pvalue(control_values, test_values, is_binary), 3)
+        p_value = round(self._calc_pvalue(control_values, test_values, is_binary), 5)
 
-        control_mean = round(np.mean(control_values), 3)
-        test_mean = round(np.mean(test_values), 3)
+        control_mean = round(np.mean(control_values), 5)
+        test_mean = round(np.mean(test_values), 5)
 
         if is_binary:
-            control_conversion = round(np.sum(control_values) / len(control_values) * 100, 3)
-            test_conversion = round(np.sum(test_values) / len(test_values) * 100, 3)
-            diff_percent = round(test_conversion - control_conversion, 3)
+            control_conversion = round(np.sum(control_values) / len(control_values) * 100, 5)
+            test_conversion = round(np.sum(test_values) / len(test_values) * 100, 5)
+            diff_percent = round(test_conversion - control_conversion, 5)
         else:
-            diff_percent = round((test_mean - control_mean) / control_mean * 100, 3) if control_mean != 0 else None
+            diff_percent = round((test_mean - control_mean) / control_mean * 100, 5) if control_mean != 0 else None
 
         diff_percent = f"{diff_percent}%" if diff_percent is not None else "N/A"
 
