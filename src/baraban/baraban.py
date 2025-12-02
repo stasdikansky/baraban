@@ -1084,7 +1084,7 @@ def calc_evan_miller_sample_size(alpha: float, power: float, base_rate: float, p
     base_rate : float
         Base conversion rate in control group
     pct_mde : float
-        Minimum detectable effect as percentage of base_rate
+        Minimum detectable effect (relative, e.g., 0.1 means 10% increase)
 
     Returns
     -------
@@ -1096,7 +1096,8 @@ def calc_evan_miller_sample_size(alpha: float, power: float, base_rate: float, p
     ValueError
         If standard deviation calculation results in NaN
     """
-    pct_mde = pct_mde / base_rate
+    # for absolute mde use:
+    # pct_mde = pct_mde / base_rate
     delta = base_rate * pct_mde
     t_alpha2 = ss.norm.ppf(1.0 - alpha / 2)
     t_beta = ss.norm.ppf(power)
