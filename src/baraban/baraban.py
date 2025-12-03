@@ -23,6 +23,12 @@ class OutlierType(str, Enum):
     LOWER = "lower"
     TWO_SIDED = "two-sided"
 
+
+class BinaryMDEType(str, Enum):
+    """Types of MDE interpretation for binary metrics"""
+    ABSOLUTE = "absolute"
+    RELATIVE = "relative"
+
 class OutlierConfig(BaseModel):
     """Configuration for outlier handling"""
     handling_method: Optional[OutlierHandlingMethod] = Field(
@@ -117,6 +123,10 @@ class SampleSizeConfig(BaseConfig):
         False,
         description="Whether to apply Asymptotic Relative Efficiency correction for non-normal distributions"
     )
+    binary_mde: BinaryMDEType = Field(
+        BinaryMDEType.ABSOLUTE,
+        description="Interpretation of MDE for binary metrics: 'absolute' or 'relative'"
+    )
 
     @field_validator("effect_sizes")
     @classmethod
@@ -156,6 +166,10 @@ class ABTestConfig(BaseConfig):
         min_items=2,
         max_items=2,
         description="List of group names [control, test]"
+    )
+    binary_mde: BinaryMDEType = Field(
+        BinaryMDEType.ABSOLUTE,
+        description="Interpretation of MDE for binary metrics in AB test: 'absolute' or 'relative'"
     )
 
     @field_validator("experiment_data")
@@ -356,7 +370,8 @@ class SampleSizeCalculator(ABTestStrategy):
                     alpha=self.config.alpha, 
                     power=self.config.power, 
                     base_rate=curr_conversion, 
-                    pct_mde=effect_size
+                    pct_mde=effect_size,
+                    binary_mde=self.config.binary_mde.value,
                 )
                 row.append(n // 100 * 100)
             data.append(row)
@@ -687,7 +702,17 @@ class ABTestCalculator(ABTestStrategy):
         if is_binary:
             control_conversion = round(np.sum(control_values) / len(control_values) * 100, 5)
             test_conversion = round(np.sum(test_values) / len(test_values) * 100, 5)
-            diff_percent = round(test_conversion - control_conversion, 5)
+            # Interpret diff according to binary_mde setting
+            if self.config.binary_mde == BinaryMDEType.ABSOLUTE:
+                # Absolute difference in percentage points
+                diff_percent = round(test_conversion - control_conversion, 5)
+            else:
+                # Relative difference vs control (in %)
+                diff_percent = (
+                    round((test_conversion - control_conversion) / control_conversion * 100, 5)
+                    if control_conversion != 0
+                    else None
+                )
         else:
             diff_percent = round((test_mean - control_mean) / control_mean * 100, 5) if control_mean != 0 else None
 
@@ -814,6 +839,7 @@ class ABTestBuilder:
         outliers_handling_method: Optional[str] = None,
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
+        binary_mde: str = "absolute",
     ) -> SampleSizeConfig:
         """Create configuration for sample size calculation.
 
@@ -864,6 +890,7 @@ class ABTestBuilder:
                 threshold_quantile=outliers_threshold_quantile,
                 type=outliers_type
             ),
+            binary_mde=BinaryMDEType(binary_mde),
         )
 
     def create_abtest_config(
@@ -880,6 +907,7 @@ class ABTestBuilder:
         outliers_handling_method: Optional[str] = None,
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
+        binary_mde: str = "absolute",
     ) -> ABTestConfig:
         """Create configuration for A/B test execution.
 
@@ -930,6 +958,7 @@ class ABTestBuilder:
                 threshold_quantile=outliers_threshold_quantile,
                 type=outliers_type
             ),
+            binary_mde=BinaryMDEType(binary_mde),
         )
 
 class ABTester:
@@ -951,6 +980,7 @@ class ABTester:
         outliers_type: Optional[str] = None,
         continuous_alternative: str = "two-sided",
         are_correction: bool = False,
+        binary_mde: str = "absolute",
     ) -> pd.DataFrame:
         """Calculate required sample size for A/B test.
         
@@ -999,6 +1029,7 @@ class ABTester:
             outliers_type=outliers_type,
             continuous_alternative=continuous_alternative,
             are_correction=are_correction,
+            binary_mde=binary_mde,
         )
         calculator = SampleSizeCalculator(config)
         return calculator.execute()
@@ -1017,6 +1048,7 @@ class ABTester:
         outliers_threshold_quantile: Optional[float] = None,
         outliers_type: Optional[str] = None,
         continuous_alternative: str = "two-sided",
+        binary_mde: str = "absolute",
     ) -> pd.DataFrame:
         """Run A/B test analysis.
         
@@ -1065,11 +1097,18 @@ class ABTester:
             outliers_threshold_quantile=outliers_threshold_quantile,
             outliers_type=outliers_type,
             continuous_alternative=continuous_alternative,
+            binary_mde=binary_mde,
         )
         calculator = ABTestCalculator(config)
         return calculator.execute()
 
-def calc_evan_miller_sample_size(alpha: float, power: float, base_rate: float, pct_mde: float) -> int:
+def calc_evan_miller_sample_size(
+    alpha: float,
+    power: float,
+    base_rate: float,
+    pct_mde: float,
+    binary_mde: str = "absolute",
+) -> int:
     """Calculate required sample size using Evan Miller's method.
 
     This function implements the sample size calculation method described by Evan Miller
@@ -1085,6 +1124,10 @@ def calc_evan_miller_sample_size(alpha: float, power: float, base_rate: float, p
         Base conversion rate in control group
     pct_mde : float
         Minimum detectable effect (relative, e.g., 0.1 means 10% increase)
+    binary_mde : str, optional
+        Interpretation of MDE for binary metrics:
+        - 'absolute': pct_mde is treated as absolute lift (e.g. 0.01 = +1pp if base_rate=0.1)
+        - 'relative': pct_mde is treated as relative lift (e.g. 0.1 = +10% of base_rate)
 
     Returns
     -------
@@ -1096,8 +1139,12 @@ def calc_evan_miller_sample_size(alpha: float, power: float, base_rate: float, p
     ValueError
         If standard deviation calculation results in NaN
     """
-    # for absolute mde use:
-    # pct_mde = pct_mde / base_rate
+    if binary_mde not in {"absolute", "relative"}:
+        raise ValueError("binary_mde must be either 'absolute' or 'relative'")
+
+    # For absolute MDE, convert absolute lift to relative w.r.t base_rate
+    if binary_mde == "absolute":
+        pct_mde = pct_mde / base_rate
     delta = base_rate * pct_mde
     t_alpha2 = ss.norm.ppf(1.0 - alpha / 2)
     t_beta = ss.norm.ppf(power)

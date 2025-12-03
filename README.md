@@ -30,6 +30,7 @@ sample_size = tester.calculate_sample_size(
     outliers_threshold_quantile=0.995,
     outliers_type='upper',
     continuous_alternative='larger',
+    binary_mde='absolute'
 )
 
 # Проведение A/B теста
